@@ -153,7 +153,7 @@ func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup
 			if catalog == nil || isWildcardStr(*catalog) {
 				query += " IN ACCOUNT"
 			} else {
-				query += " IN DATABASE " + quoteTblName(*catalog)
+				query += " IN DATABASE " + quoteIdentifier(*catalog)
 			}
 		case objViews, objTables, objObjects:
 			query = addLike(query, tableName)
@@ -161,11 +161,11 @@ func goGetQueryID(ctx context.Context, conn driver.QueryerContext, grp *errgroup
 			if catalog == nil || isWildcardStr(*catalog) {
 				query += " IN ACCOUNT"
 			} else {
-				escapedCatalog := quoteTblName(*catalog)
+				escapedCatalog := quoteIdentifier(*catalog)
 				if dbSchema == nil || isWildcardStr(*dbSchema) {
 					query += " IN DATABASE " + escapedCatalog
 				} else {
-					query += " IN SCHEMA " + escapedCatalog + "." + quoteTblName(*dbSchema)
+					query += " IN SCHEMA " + escapedCatalog + "." + quoteIdentifier(*dbSchema)
 				}
 			}
 		default:
@@ -247,15 +247,15 @@ func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth,
 		if catalog == nil || isWildcardStr(*catalog) {
 			suffix = " IN ACCOUNT"
 		} else {
-			escapedCatalog := quoteTblName(*catalog)
+			escapedCatalog := quoteIdentifier(*catalog)
 			if dbSchema == nil || isWildcardStr(*dbSchema) {
 				suffix = " IN DATABASE " + escapedCatalog
 			} else {
-				escapedSchema := quoteTblName(*dbSchema)
+				escapedSchema := quoteIdentifier(*dbSchema)
 				if tableName == nil || isWildcardStr(*tableName) {
 					suffix = " IN SCHEMA " + escapedCatalog + "." + escapedSchema
 				} else {
-					escapedTable := quoteTblName(*tableName)
+					escapedTable := quoteIdentifier(*tableName)
 					suffix = " IN TABLE " + escapedCatalog + "." + escapedSchema + "." + escapedTable
 				}
 			}
@@ -413,13 +413,13 @@ func (c *connectionImpl) GetCurrentDbSchema() (string, error) {
 
 // SetCurrentCatalog implements driverbase.CurrentNamespacer.
 func (c *connectionImpl) SetCurrentCatalog(value string) error {
-	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE DATABASE %s;", quoteTblName(value)), nil)
+	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE DATABASE %s;", quoteIdentifier(value)), nil)
 	return err
 }
 
 // SetCurrentDbSchema implements driverbase.CurrentNamespacer.
 func (c *connectionImpl) SetCurrentDbSchema(value string) error {
-	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE SCHEMA %s;", quoteTblName(value)), nil)
+	_, err := c.cn.ExecContext(context.Background(), fmt.Sprintf("USE SCHEMA %s;", quoteIdentifier(value)), nil)
 	return err
 }
 
@@ -662,12 +662,12 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 
 	tblParts := make([]string, 0, 3)
 	if catalog != nil {
-		tblParts = append(tblParts, quoteTblName(*catalog))
+		tblParts = append(tblParts, quoteIdentifier(*catalog))
 	}
 	if dbSchema != nil {
-		tblParts = append(tblParts, quoteTblName(*dbSchema))
+		tblParts = append(tblParts, quoteIdentifier(*dbSchema))
 	}
-	tblParts = append(tblParts, quoteTblName(tableName))
+	tblParts = append(tblParts, quoteIdentifier(tableName))
 	fullyQualifiedTable := strings.Join(tblParts, ".")
 
 	var rows driver.Rows
