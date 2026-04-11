@@ -131,8 +131,8 @@ type ingestOptions struct {
 	geoType string
 }
 
-func DefaultIngestOptions() *ingestOptions {
-	return &ingestOptions{
+func DefaultIngestOptions() ingestOptions {
+	return ingestOptions{
 		targetFileSize:    defaultTargetFileSize,
 		writerConcurrency: defaultWriterConcurrency,
 		uploadConcurrency: defaultUploadConcurrency,
@@ -167,7 +167,7 @@ func (st *statement) ingestRecord(ctx context.Context) (nrows int64, err error) 
 		return
 	}
 
-	parquetProps, arrowProps := newWriterProps(st.alloc, st.ingestOptions)
+	parquetProps, arrowProps := newWriterProps(st.alloc, &st.ingestOptions)
 	g := errgroup.Group{}
 
 	// writeParquet takes a channel of Records, but we only have one Record to write
@@ -266,7 +266,7 @@ func (st *statement) ingestStream(ctx context.Context) (nrows int64, err error) 
 		}
 	}()
 
-	parquetProps, arrowProps := newWriterProps(st.alloc, st.ingestOptions)
+	parquetProps, arrowProps := newWriterProps(st.alloc, &st.ingestOptions)
 	g, gCtx := errgroup.WithContext(ctx)
 
 	// Read records into channel
@@ -555,8 +555,8 @@ func executeCopyQuery(ctx context.Context, cn snowflakeConn, tableName string, f
 		return nil
 	}
 
+	vals := make([]driver.Value, len(rows.Columns()))
 	for {
-		vals := make([]driver.Value, len(rows.Columns()))
 		err := rows.Next(vals)
 		if err == io.EOF {
 			break

@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
+	"github.com/adbc-drivers/driverbase-go/testutil"
 	driver "github.com/adbc-drivers/snowflake/go"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-adbc/go/adbc/validation"
@@ -59,6 +60,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
+
+// quoteIdentifier quotes a Snowflake identifier to handle special characters and preserve case.
+// This is used for table names, schema names, catalog names, and column names.
+func quoteIdentifier(identifier string) string {
+	escaped := strings.ReplaceAll(identifier, `"`, `""`)
+	return fmt.Sprintf(`"%s"`, escaped)
+}
 
 type SnowflakeQuirks struct {
 	dsn         string
@@ -152,14 +160,10 @@ func getArr(arr arrow.Array) any {
 	}
 }
 
-func quoteTblName(name string) string {
-	return "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
-}
-
 func (s *SnowflakeQuirks) CreateSampleTable(tableName string, r arrow.RecordBatch) (err error) {
 	var b strings.Builder
 	b.WriteString("CREATE OR REPLACE TABLE ")
-	b.WriteString(quoteTblName(tableName))
+	b.WriteString(quoteIdentifier(tableName))
 	b.WriteString(" (")
 
 	for i := range r.NumCols() {
@@ -182,7 +186,7 @@ func (s *SnowflakeQuirks) CreateSampleTable(tableName string, r arrow.RecordBatc
 		return err
 	}
 
-	insertQuery := "INSERT INTO " + quoteTblName(tableName) + " VALUES ("
+	insertQuery := "INSERT INTO " + quoteIdentifier(tableName) + " VALUES ("
 	bindings := strings.Repeat("?,", int(r.NumCols()))
 	insertQuery += bindings[:len(bindings)-1] + ")"
 
@@ -206,7 +210,7 @@ func (s *SnowflakeQuirks) DropTable(cnxn adbc.Connection, tblname string) error 
 		}
 	}()
 
-	if err = stmt.SetSqlQuery(`DROP TABLE IF EXISTS ` + quoteTblName(tblname)); err != nil {
+	if err = stmt.SetSqlQuery(`DROP TABLE IF EXISTS ` + quoteIdentifier(tblname)); err != nil {
 		return err
 	}
 
@@ -222,7 +226,7 @@ func (s *SnowflakeQuirks) SupportsCurrentCatalogSchema() bool          { return 
 func (s *SnowflakeQuirks) SupportsExecuteSchema() bool                 { return true }
 func (s *SnowflakeQuirks) SupportsGetSetOptions() bool                 { return true }
 func (s *SnowflakeQuirks) SupportsPartitionedData() bool               { return false }
-func (s *SnowflakeQuirks) SupportsStatistics() bool                    { return false }
+func (s *SnowflakeQuirks) SupportsStatistics() bool                    { return true }
 func (s *SnowflakeQuirks) SupportsTransactions() bool                  { return true }
 func (s *SnowflakeQuirks) SupportsGetParameterSchema() bool            { return false }
 func (s *SnowflakeQuirks) SupportsDynamicParameterBinding() bool       { return false }
@@ -3042,4 +3046,160 @@ func TestJwtAuthenticationUnencryptedValueUnauthorized(t *testing.T) {
 	cfg.User = "non_existent_user"
 
 	ConnectWithJwt(t, cfg, keyValue, "", false)
+}
+
+func (suite *SnowflakeTests) TestGetStatisticNames() {
+	statsCnxn, ok := suite.cnxn.(adbc.ConnectionGetStatistics)
+	suite.Require().True(ok, "Snowflake must implement ConnectionGetStatistics")
+
+	rdr, err := statsCnxn.GetStatisticNames(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	// Verify schema matches ADBC spec
+	suite.True(adbc.GetStatisticNamesSchema.Equal(rdr.Schema()),
+		"expected: %s\ngot: %s", adbc.GetStatisticNamesSchema, rdr.Schema())
+
+	// Verify exactly 6 Snowflake-specific rows
+	suite.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	suite.Equal(int64(6), rec.NumRows())
+}
+
+func (suite *SnowflakeTests) TestGetStatisticsBasic() {
+	// Create a persistent test table (if not exists) to ensure consistent results
+	// across test runs despite INFORMATION_SCHEMA caching
+	suite.Require().NoError(suite.stmt.SetSqlQuery(`
+		CREATE TABLE IF NOT EXISTS statistics_test (
+			id INTEGER,
+			category VARCHAR(50),
+			name VARCHAR(100),
+			value FLOAT
+		) CLUSTER BY (category)
+	`))
+	_, err := suite.stmt.ExecuteUpdate(suite.ctx)
+	suite.Require().NoError(err)
+
+	// Check if table is empty, if so populate it with 400 rows
+	suite.Require().NoError(suite.stmt.SetSqlQuery(`SELECT COUNT(*) FROM statistics_test`))
+	countRdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	suite.Require().True(countRdr.Next())
+	count := countRdr.RecordBatch().Column(0).(*array.Int64).Value(0)
+	countRdr.Release()
+
+	if count == 0 {
+		suite.Require().NoError(suite.stmt.SetSqlQuery(`
+			INSERT INTO statistics_test
+			SELECT
+				seq4() as id,
+				CASE MOD(seq4(), 3) WHEN 0 THEN 'A' WHEN 1 THEN 'B' ELSE 'C' END as category,
+				'test_' || seq4() as name,
+				UNIFORM(1, 400, RANDOM()) as value
+			FROM TABLE(GENERATOR(ROWCOUNT => 400))
+		`))
+		_, err = suite.stmt.ExecuteUpdate(suite.ctx)
+		suite.Require().NoError(err)
+	}
+
+	// Get the current database and schema
+	var currentDb, currentSchema string
+	suite.Require().NoError(suite.stmt.SetSqlQuery("SELECT CURRENT_DATABASE(), CURRENT_SCHEMA()"))
+	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	suite.Require().NoError(err)
+	defer rdr.Release()
+
+	suite.Require().True(rdr.Next())
+	rec := rdr.RecordBatch()
+	currentDb = rec.Column(0).(*array.String).Value(0)
+	currentSchema = rec.Column(1).(*array.String).Value(0)
+
+	gs, ok := suite.cnxn.(adbc.ConnectionGetStatistics)
+	if !ok {
+		suite.T().Skip("GetStatistics not supported")
+	}
+
+	// Test Get statistics with specific table filter
+	tableName := "STATISTICS_TEST"
+	statsRdr, err := gs.GetStatistics(suite.ctx, &currentDb, &currentSchema, &tableName, false)
+	suite.Require().NoError(err)
+	defer statsRdr.Release()
+
+	// Verify schema matches ADBC spec
+	suite.True(adbc.GetStatisticsSchema.Equal(statsRdr.Schema()),
+		"Schema should match ADBC spec\nexpected: %s\ngot: %s",
+		adbc.GetStatisticsSchema, statsRdr.Schema())
+
+	// Read and extract statistics for our table
+	var allStats []testutil.Statistic
+	for statsRdr.Next() {
+		rec := statsRdr.RecordBatch()
+		suite.Greater(rec.NumRows(), int64(0), "Should have at least one catalog")
+		stats := testutil.ExtractStatisticsForTable(rec, currentDb, currentSchema, tableName)
+		allStats = append(allStats, stats...)
+	}
+	suite.NoError(statsRdr.Err())
+
+	suite.Greater(len(allStats), 0, "Should find statistics for STATISTICS_TEST table")
+
+	// Convert to lookup map for easier assertions
+	statsMap := testutil.StatisticsToLookupMap(allStats)
+
+	// Row count: We inserted 400 rows (4 batches × 100)
+	rowCount, ok := statsMap[int16(6)].StatisticValue.(float64)
+	suite.True(ok, "row_count statistic should be present as float64")
+	suite.GreaterOrEqual(rowCount, float64(400), "Row count should be non-negative")
+	suite.True(statsMap[int16(6)].IsApproximate, "row_count should be approximate (cached)")
+	suite.T().Logf("Row count: %.0f (note: may be stale due to INFORMATION_SCHEMA caching)", rowCount)
+
+	// Bytes: Should be > 0, reasonable size for 400 rows with data
+	bytes, ok := statsMap[int16(1024)].StatisticValue.(int64)
+	suite.True(ok, "bytes statistic should be present")
+	suite.Greater(bytes, int64(1000), "Bytes should be > 1000 for 400 rows with data")
+	suite.True(statsMap[int16(1024)].IsApproximate, "bytes should be approximate (cached)")
+	suite.T().Logf("Bytes: %d", bytes)
+
+	// Retention time: Default is usually 1 day for new tables
+	retentionTime, ok := statsMap[int16(1025)].StatisticValue.(int64)
+	suite.True(ok, "retention_time statistic should be present")
+	suite.GreaterOrEqual(retentionTime, int64(1), "Retention time should be at least 1 day")
+	suite.True(statsMap[int16(1025)].IsApproximate, "retention_time should be approximate (cached)")
+	suite.T().Logf("Retention time: %d days", retentionTime)
+
+	// Check if clustering depth is present
+	if clusteringDepth, ok := statsMap[int16(1029)].StatisticValue.(float64); ok {
+		suite.T().Logf("Clustering depth found: %.2f", clusteringDepth)
+		// In exact mode, clustering depth should NOT be approximate
+		suite.False(statsMap[int16(1029)].IsApproximate, "clustering_depth should be exact (not approximate) in exact mode")
+		suite.GreaterOrEqual(clusteringDepth, 0.0, "Clustering depth should be non-negative")
+	} else {
+		suite.T().Log("Clustering depth not returned (may require table to be physically clustered)")
+	}
+
+	// Check for storage breakdown statistics (may not be present without ACCOUNTADMIN)
+	hasStorageMetrics := false
+	if activeBytes, ok := statsMap[int16(1026)].StatisticValue.(int64); ok {
+		suite.T().Logf("Active bytes found: %d", activeBytes)
+		suite.GreaterOrEqual(activeBytes, int64(0), "Active bytes should be non-negative")
+		// In exact mode, storage metrics should NOT be approximate
+		suite.False(statsMap[int16(1026)].IsApproximate, "active_bytes should be exact (not approximate) in exact mode")
+		hasStorageMetrics = true
+	}
+	if timeTravelBytes, ok := statsMap[int16(1027)].StatisticValue.(int64); ok {
+		suite.T().Logf("Time Travel bytes found: %d", timeTravelBytes)
+		suite.GreaterOrEqual(timeTravelBytes, int64(0), "Time Travel bytes should be non-negative")
+		suite.False(statsMap[int16(1027)].IsApproximate, "time_travel_bytes should be exact (not approximate) in exact mode")
+	}
+	if failsafeBytes, ok := statsMap[int16(1028)].StatisticValue.(int64); ok {
+		suite.T().Logf("Failsafe bytes found: %d", failsafeBytes)
+		suite.GreaterOrEqual(failsafeBytes, int64(0), "Failsafe bytes should be non-negative")
+		suite.False(statsMap[int16(1028)].IsApproximate, "failsafe_bytes should be exact (not approximate) in exact mode")
+	}
+
+	if !hasStorageMetrics {
+		suite.T().Log("Storage breakdown statistics not returned (requires ACCOUNTADMIN privileges)")
+	}
+
+	// Note: We intentionally don't drop the table to keep it for subsequent test runs,
+	// ensuring consistent results despite INFORMATION_SCHEMA caching
 }
