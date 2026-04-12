@@ -439,7 +439,13 @@ func toSnowflakeType(dt arrow.DataType, geoType string) string {
 	return ""
 }
 
-func (st *statement) initIngest(ctx context.Context) error {
+// initIngest creates the target table for ingestion.
+//
+// geoTypeOverrides maps field names to Snowflake types ("geography" or "geometry")
+// for geo columns that should be created with native types instead of their Arrow
+// storage type (BINARY/TEXT). This is used when COPY transform handles inline
+// conversion, so the table must have native geo columns from the start.
+func (st *statement) initIngest(ctx context.Context, geoTypeOverrides map[string]string) error {
 	var (
 		createBldr strings.Builder
 	)
@@ -465,7 +471,14 @@ func (st *statement) initIngest(ctx context.Context) error {
 
 		createBldr.WriteString(quoteIdentifier(f.Name))
 		createBldr.WriteString(" ")
-		ty := toSnowflakeType(f.Type, st.ingestOptions.geoType)
+
+		// Use geo type override if provided (for COPY transform path).
+		var ty string
+		if override, ok := geoTypeOverrides[f.Name]; ok {
+			ty = override
+		} else {
+			ty = toSnowflakeType(f.Type, st.ingestOptions.geoType)
+		}
 		if ty == "" {
 			return adbc.Error{
 				Msg:  fmt.Sprintf("unimplemented type conversion for field %s, arrow type: %s", f.Name, f.Type),
@@ -524,29 +537,144 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 		schema = st.streamBind.Schema()
 	}
 
-	err := st.initIngest(ctx)
+	// Build the COPY query. If the schema has geo columns, build a COPY transform
+	// that converts WKB/WKT → GEOGRAPHY/GEOMETRY inline during COPY INTO.
+	// This avoids the expensive post-COPY rename+CTAS+drop pattern.
+	copyQ, usedGeoTransform, geoOverrides := st.buildCopyQuery(schema)
+
+	err := st.initIngest(ctx, geoOverrides)
 	if err != nil {
 		return -1, err
 	}
 
 	var nrows int64
 	if st.bound != nil {
-		nrows, err = st.ingestRecord(ctx)
+		nrows, err = st.ingestRecord(ctx, copyQ)
 	} else {
-		nrows, err = st.ingestStream(ctx)
+		nrows, err = st.ingestStream(ctx, copyQ)
 	}
 	if err != nil {
 		return nrows, err
 	}
 
-	// Convert geo columns from BINARY/TEXT to GEOGRAPHY/GEOMETRY after COPY INTO.
-	// Snowflake's COPY INTO cannot load WKB directly into GEOGRAPHY columns,
-	// so we load as BINARY first, then convert via CTAS.
-	if err := st.convertGeoColumns(ctx, schema); err != nil {
-		return nrows, err
+	// Only run post-COPY geo conversion if the COPY transform wasn't used.
+	// The COPY transform handles conversion inline, so no CTAS is needed.
+	if !usedGeoTransform {
+		if err := st.convertGeoColumns(ctx, schema); err != nil {
+			return nrows, err
+		}
 	}
 
 	return nrows, nil
+}
+
+// buildCopyQuery returns the COPY query to use for ingestion and whether a geo
+// transform was applied. When the schema contains geoarrow columns, a COPY
+// transform is returned that converts WKB/WKT to GEOGRAPHY/GEOMETRY inline
+// during COPY INTO — eliminating the need for a post-COPY CTAS.
+//
+// Snowflake's COPY INTO from Parquet normally cannot load WKB directly into
+// GEOGRAPHY/GEOMETRY columns. A COPY transform works around this by applying
+// TO_GEOGRAPHY/TO_GEOMETRY in the SELECT clause of the COPY subquery.
+// buildCopyQuery returns the COPY query, whether a geo transform was used, and
+// a map of geo column name → Snowflake type for table creation overrides.
+func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, bool, map[string]string) {
+	if schema == nil {
+		return copyQuery, false, nil
+	}
+
+	// Detect geo columns from schema (same logic as convertGeoColumns).
+	type geoCol struct {
+		name    string
+		extName string
+		extMeta string
+	}
+	var geoCols []geoCol
+
+	for _, f := range schema.Fields() {
+		var extName, extMeta string
+		if f.Type.ID() == arrow.EXTENSION {
+			ext := f.Type.(arrow.ExtensionType)
+			extName = ext.ExtensionName()
+			extMeta = ext.Serialize()
+		} else if name, ok := f.Metadata.GetValue("ARROW:extension:name"); ok {
+			extName = name
+			extMeta, _ = f.Metadata.GetValue("ARROW:extension:metadata")
+		}
+
+		switch extName {
+		case "geoarrow.wkb", "geoarrow.wkb_view", "geoarrow.wkt", "geoarrow.wkt_view":
+			geoCols = append(geoCols, geoCol{name: f.Name, extName: extName, extMeta: extMeta})
+		}
+	}
+
+	if len(geoCols) == 0 {
+		return copyQuery, false, nil
+	}
+
+	// Build a COPY transform with inline geo conversion.
+	geoType := st.ingestOptions.geoType
+	var selectCols []string
+	for _, f := range schema.Fields() {
+		quoted := fmt.Sprintf("%q", f.Name)
+		parqRef := fmt.Sprintf("$1:%s", quoted)
+
+		// Check if this field is a geo column.
+		var gc *geoCol
+		for i := range geoCols {
+			if geoCols[i].name == f.Name {
+				gc = &geoCols[i]
+				break
+			}
+		}
+
+		if gc == nil {
+			// Non-geo column: reference directly from Parquet, Snowflake auto-casts to target type.
+			selectCols = append(selectCols, fmt.Sprintf("%s AS %s", parqRef, quoted))
+			continue
+		}
+
+		// Geo column: apply conversion function.
+		isWKB := strings.Contains(gc.extName, "wkb")
+		var expr string
+		if geoType == "geography" {
+			if isWKB {
+				expr = fmt.Sprintf("TO_GEOGRAPHY(%s::BINARY, true) AS %s", parqRef, quoted)
+			} else {
+				expr = fmt.Sprintf("TRY_TO_GEOGRAPHY(%s::VARCHAR) AS %s", parqRef, quoted)
+			}
+		} else {
+			srid := extractSRIDFromMeta(gc.extMeta)
+			if srid != 0 {
+				if isWKB {
+					expr = fmt.Sprintf("ST_SETSRID(TO_GEOMETRY(%s::BINARY), %d) AS %s", parqRef, srid, quoted)
+				} else {
+					expr = fmt.Sprintf("ST_SETSRID(TO_GEOMETRY(%s::VARCHAR), %d) AS %s", parqRef, srid, quoted)
+				}
+			} else {
+				if isWKB {
+					expr = fmt.Sprintf("TO_GEOMETRY(%s::BINARY) AS %s", parqRef, quoted)
+				} else {
+					expr = fmt.Sprintf("TO_GEOMETRY(%s::VARCHAR) AS %s", parqRef, quoted)
+				}
+			}
+		}
+		selectCols = append(selectCols, expr)
+	}
+
+	// Build the geo type overrides for initIngest — the table must have native
+	// GEOGRAPHY/GEOMETRY columns for the COPY transform to write into.
+	geoOverrides := make(map[string]string, len(geoCols))
+	for _, gc := range geoCols {
+		geoOverrides[gc.name] = geoType
+	}
+
+	transformQ := fmt.Sprintf(
+		"COPY INTO IDENTIFIER(?) FROM (SELECT %s FROM @%s)",
+		strings.Join(selectCols, ", "),
+		bindStageName,
+	)
+	return transformQ, true, geoOverrides
 }
 
 // convertGeoColumns converts BINARY/TEXT geo columns to GEOGRAPHY/GEOMETRY after COPY INTO.
@@ -597,8 +725,8 @@ func (st *statement) convertGeoColumns(ctx context.Context, schema *arrow.Schema
 	}
 
 	geoType := st.ingestOptions.geoType
-	target := quoteTblName(st.targetTable)
-	staging := quoteTblName(st.targetTable + "_ADBC_STAGING")
+	target := quoteIdentifier(st.targetTable)
+	staging := quoteIdentifier(st.targetTable + "_ADBC_STAGING")
 
 	// Rename current table to staging
 	renameQuery := fmt.Sprintf("ALTER TABLE %s RENAME TO %s", target, staging)
@@ -619,7 +747,7 @@ func (st *statement) convertGeoColumns(ctx context.Context, schema *arrow.Schema
 			}
 		}
 
-		quoted := quoteTblName(f.Name)
+		quoted := quoteIdentifier(f.Name)
 		if !isGeo {
 			selectCols = append(selectCols, quoted)
 			continue
