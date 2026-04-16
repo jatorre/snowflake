@@ -671,7 +671,7 @@ func (c *connectionImpl) detectGeoColumnsFromQuery(ctx context.Context, query st
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	geoCols := make(map[string]geoColumnType)
 	dest := make([]driver.Value, len(rows.Columns()))
