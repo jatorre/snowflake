@@ -637,13 +637,74 @@ func descToField(name, typ, isnull, primary string, comment sql.NullString, maxT
 	return
 }
 
+func quoteSnowflakeIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+func parseSnowflakeSRIDValue(value driver.Value) (int, bool) {
+	switch v := value.(type) {
+	case nil:
+		return 0, false
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case string:
+		srid, err := strconv.Atoi(v)
+		return srid, err == nil
+	case []byte:
+		srid, err := strconv.Atoi(string(v))
+		return srid, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func (c *connectionImpl) detectGeometryColumnSRID(ctx context.Context, tableName, columnName string) int {
+	quotedColumn := quoteSnowflakeIdentifier(columnName)
+	query := fmt.Sprintf(
+		"SELECT ST_SRID(%[1]s) FROM %[2]s WHERE %[1]s IS NOT NULL GROUP BY ST_SRID(%[1]s) LIMIT 2",
+		quotedColumn,
+		tableName,
+	)
+	rows, err := c.cn.QueryContext(ctx, query, nil)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = rows.Close() }()
+
+	var dest [1]driver.Value
+	var srid int
+	seen := false
+	for {
+		err := rows.Next(dest[:])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0
+		}
+		if seen {
+			// Arrow field metadata can only represent one CRS for the column.
+			return 0
+		}
+		var ok bool
+		srid, ok = parseSnowflakeSRIDValue(dest[0])
+		if !ok {
+			return 0
+		}
+		seen = true
+	}
+	return srid
+}
+
 // detectGeoColumnsFromQuery attempts to extract a table name from a SQL query
 // and runs DESCRIBE TABLE to identify GEOGRAPHY/GEOMETRY columns.
 // Returns nil if the table name can't be determined or no geo columns exist.
 // This works for table scans (SELECT ... FROM schema.table) which is the common
 // case for adbc_scan. Arbitrary queries return nil — data is correct but without
 // geoarrow metadata. TODO: Support arbitrary queries.
-func (c *connectionImpl) detectGeoColumnsFromQuery(ctx context.Context, query string) map[string]geoColumnType {
+func (c *connectionImpl) detectGeoColumnsFromQuery(ctx context.Context, query string) map[string]geoColumnInfo {
 	// Simple extraction: find "FROM <table>" in the query.
 	// Handles: SELECT ... FROM schema.table, SELECT ... FROM "schema"."table", etc.
 	upper := strings.ToUpper(strings.TrimSpace(query))
@@ -673,7 +734,7 @@ func (c *connectionImpl) detectGeoColumnsFromQuery(ctx context.Context, query st
 	}
 	defer func() { _ = rows.Close() }()
 
-	geoCols := make(map[string]geoColumnType)
+	geoCols := make(map[string]geoColumnInfo)
 	dest := make([]driver.Value, len(rows.Columns()))
 	for {
 		if err := rows.Next(dest); err != nil {
@@ -687,9 +748,12 @@ func (c *connectionImpl) detectGeoColumnsFromQuery(ctx context.Context, query st
 		typ = strings.ToUpper(typ)
 
 		if strings.HasPrefix(typ, "GEOGRAPHY") {
-			geoCols[name] = geoColumnGeography
+			geoCols[name] = geoColumnInfo{typ: geoColumnGeography, srid: 4326}
 		} else if strings.HasPrefix(typ, "GEOMETRY") {
-			geoCols[name] = geoColumnGeometry
+			geoCols[name] = geoColumnInfo{
+				typ:  geoColumnGeometry,
+				srid: c.detectGeometryColumnSRID(ctx, tableName, name),
+			}
 		}
 	}
 

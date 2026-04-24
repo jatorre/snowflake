@@ -57,6 +57,11 @@ const (
 	geoColumnGeometry                // GEOMETRY — SRID unknown without data inspection
 )
 
+type geoColumnInfo struct {
+	typ  geoColumnType
+	srid int
+}
+
 func identCol(_ context.Context, a arrow.Array) (arrow.Array, error) {
 	a.Retain()
 	return a, nil
@@ -96,7 +101,7 @@ func getRecTransformer(sc *arrow.Schema, tr []colTransformer) recordTransformer 
 	}
 }
 
-func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnType) (*arrow.Schema, recordTransformer) {
+func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnInfo) (*arrow.Schema, recordTransformer) {
 	loc, types := ld.Location(), ld.RowTypes()
 
 	fields := make([]arrow.Field, len(sc.Fields()))
@@ -109,20 +114,21 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 		// but srcMeta.Type is "binary" (Snowflake REST API limitation). Use the geoCols
 		// map (from DESCRIBE TABLE) to identify them and tag with geoarrow.wkb metadata.
 		// Data is already WKB binary — no conversion needed, just pass through.
-		if geoType, ok := geoCols[f.Name]; ok && geoType != geoColumnNone {
+		if geoCol, ok := geoCols[f.Name]; ok && geoCol.typ != geoColumnNone {
 			f.Type = arrow.BinaryTypes.Binary
-			if geoType == geoColumnGeography {
+			if geoCol.typ == geoColumnGeography {
 				f.Metadata = arrow.MetadataFrom(map[string]string{
 					"ARROW:extension:name":     "geoarrow.wkb",
 					"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
 				})
 			} else {
-				// TODO: GEOMETRY SRID requires inspecting data or a separate query.
-				// Same cross-driver issue as adbc-drivers/redshift#2 and
-				// adbc-drivers/databricks#350.
-				f.Metadata = arrow.MetadataFrom(map[string]string{
+				metadata := map[string]string{
 					"ARROW:extension:name": "geoarrow.wkb",
-				})
+				}
+				if geoCol.srid != 0 {
+					metadata["ARROW:extension:metadata"] = fmt.Sprintf(`{"crs":"EPSG:%d"}`, geoCol.srid)
+				}
+				f.Metadata = arrow.MetadataFrom(metadata)
 			}
 			transformers[i] = identCol
 			fields[i] = f
@@ -593,7 +599,7 @@ type reader struct {
 	done     chan struct{} // signals all producer goroutines have finished
 }
 
-func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnType) (array.RecordReader, error) {
+func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnInfo) (array.RecordReader, error) {
 	batches, err := ld.GetBatches()
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusInternal, err)
