@@ -273,6 +273,7 @@ func (st *statement) SetOption(key string, val string) error {
 		switch strings.ToLower(val) {
 		case "geography", "geometry":
 			st.ingestOptions.geoType = strings.ToLower(val)
+			st.ingestOptions.geoTypeExplicit = true
 		default:
 			return adbc.Error{
 				Msg:  fmt.Sprintf("[Snowflake] invalid geo type '%s': must be 'geography' or 'geometry'", val),
@@ -612,8 +613,10 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, bool, map[str
 		return copyQuery, false, nil
 	}
 
-	// Build a COPY transform with inline geo conversion.
-	geoType := st.ingestOptions.geoType
+	// Build a COPY transform with inline geo conversion. Each geo column's
+	// target type is resolved per-column so a non-4326 CRS can promote that
+	// column to GEOMETRY while sibling 4326 columns stay GEOGRAPHY.
+	geoOverrides := make(map[string]string, len(geoCols))
 	var selectCols []string
 	for _, f := range schema.Fields() {
 		quoted := fmt.Sprintf("%q", f.Name)
@@ -636,6 +639,8 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, bool, map[str
 
 		// Geo column: apply conversion function.
 		isWKB := strings.Contains(gc.extName, "wkb")
+		geoType := st.ingestOptions.resolveGeoType(gc.extMeta)
+		geoOverrides[gc.name] = geoType
 		var expr string
 		if geoType == "geography" {
 			if isWKB {
@@ -660,13 +665,6 @@ func (st *statement) buildCopyQuery(schema *arrow.Schema) (string, bool, map[str
 			}
 		}
 		selectCols = append(selectCols, expr)
-	}
-
-	// Build the geo type overrides for initIngest — the table must have native
-	// GEOGRAPHY/GEOMETRY columns for the COPY transform to write into.
-	geoOverrides := make(map[string]string, len(geoCols))
-	for _, gc := range geoCols {
-		geoOverrides[gc.name] = geoType
 	}
 
 	transformQ := fmt.Sprintf(
@@ -724,7 +722,6 @@ func (st *statement) convertGeoColumns(ctx context.Context, schema *arrow.Schema
 		return nil
 	}
 
-	geoType := st.ingestOptions.geoType
 	target := quoteIdentifier(st.targetTable)
 	staging := quoteIdentifier(st.targetTable + "_ADBC_STAGING")
 
@@ -758,6 +755,7 @@ func (st *statement) convertGeoColumns(ctx context.Context, schema *arrow.Schema
 		// For WKT: TRY_TO_GEOGRAPHY(text) or TO_GEOMETRY(text).
 		var expr string
 		isWKB := strings.Contains(gc.extName, "wkb")
+		geoType := st.ingestOptions.resolveGeoType(gc.extMeta)
 		if geoType == "geography" {
 			if isWKB {
 				expr = fmt.Sprintf("TO_GEOGRAPHY(%s, true) AS %s", quoted, quoted)
@@ -790,6 +788,22 @@ func (st *statement) convertGeoColumns(ctx context.Context, schema *arrow.Schema
 	st.cnxn.cn.ExecContext(ctx, dropQuery, nil)
 
 	return nil
+}
+
+// resolveGeoType picks the Snowflake target type for a single geoarrow column.
+// When the user has set ingest_geo_type explicitly, that value is honored for
+// every column (current behavior). Otherwise the column's CRS metadata decides:
+// any non-EPSG:4326 SRID promotes the column to GEOMETRY so the SRID survives
+// the round trip; missing CRS, EPSG:4326, or unparseable CRS stays GEOGRAPHY.
+func (opts *ingestOptions) resolveGeoType(extMeta string) string {
+	if opts.geoTypeExplicit {
+		return opts.geoType
+	}
+	srid := extractSRIDFromMeta(extMeta)
+	if srid != 0 && srid != 4326 {
+		return "geometry"
+	}
+	return "geography"
 }
 
 // extractSRIDFromMeta extracts the SRID from geoarrow extension metadata string.
@@ -888,7 +902,7 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 					return nil, err
 				}
 
-				reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.maxTimestampPrecision, nil)
+				reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.maxTimestampPrecision)
 				return reader, err
 			},
 			currentBatch: st.bound,
@@ -906,12 +920,6 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 		return
 	}
 
-	// Detect geo columns before executing the query. For table scans,
-	// try to extract the table name and run DESCRIBE TABLE to identify
-	// GEOGRAPHY/GEOMETRY columns (catalog metadata is unaffected by WKB output format).
-	// TODO: Support arbitrary queries — currently only table scans get geoarrow metadata.
-	geoCols := st.cnxn.detectGeoColumnsFromQuery(ctx, st.query)
-
 	var loader gosnowflake.ArrowStreamLoader
 	loader, err = st.cnxn.cn.QueryArrowStream(ctx, st.query)
 	if err != nil {
@@ -919,7 +927,7 @@ func (st *statement) ExecuteQuery(ctx context.Context) (reader array.RecordReade
 		return
 	}
 
-	reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.maxTimestampPrecision, geoCols)
+	reader, err = newRecordReader(ctx, st.alloc, loader, st.queueSize, st.prefetchConcurrency, st.useHighPrecision, st.maxTimestampPrecision)
 	nRows = loader.TotalRows()
 	return
 }

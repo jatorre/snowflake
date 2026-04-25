@@ -25,6 +25,7 @@ package snowflake
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -48,18 +49,185 @@ import (
 
 const MetadataKeySnowflakeType = "SNOWFLAKE_TYPE"
 
-// geoColumnType identifies the Snowflake geospatial type of a column.
-type geoColumnType int
-
+// EWKB extension flags. The high four bits of the geometry-type word in the
+// PostGIS-style EWKB encoding carry SRID/Z/M information; the low 28 bits are
+// the OGC geometry type (with optional ISO Z/M offsets).
 const (
-	geoColumnNone      geoColumnType = iota
-	geoColumnGeography               // GEOGRAPHY — always WGS84/SRID 4326
-	geoColumnGeometry                // GEOMETRY — SRID unknown without data inspection
+	ewkbSRIDFlag uint32 = 0x20000000
+	ewkbMFlag    uint32 = 0x40000000
+	ewkbZFlag    uint32 = 0x80000000
 )
+
+// geoColumnInfo captures what the EWKB peek learned about a binary column.
+// A zero srid means "looks like WKB/EWKB but no usable column-level CRS"
+// (either every value was plain WKB without an SRID prefix, or rows disagreed
+// on SRID); the column is still tagged as geoarrow.wkb.
+type geoColumnInfo struct {
+	srid int
+}
 
 func identCol(_ context.Context, a arrow.Array) (arrow.Array, error) {
 	a.Retain()
 	return a, nil
+}
+
+// peekEWKBGeo inspects the first bytes of a value and returns whether they
+// look like a valid OGC/EWKB geometry header. When the EWKB SRID flag is set,
+// the embedded SRID is returned with hasSRID=true.
+func peekEWKBGeo(b []byte) (srid uint32, hasSRID bool, ok bool) {
+	if len(b) < 5 {
+		return 0, false, false
+	}
+	var bo binary.ByteOrder
+	switch b[0] {
+	case 0x00:
+		bo = binary.BigEndian
+	case 0x01:
+		bo = binary.LittleEndian
+	default:
+		return 0, false, false
+	}
+	typeWord := bo.Uint32(b[1:5])
+	base := typeWord & 0x0FFFFFFF
+	if !validGeoTypeCode(base) {
+		return 0, false, false
+	}
+	if typeWord&ewkbSRIDFlag == 0 {
+		return 0, false, true
+	}
+	if len(b) < 9 {
+		return 0, false, false
+	}
+	return bo.Uint32(b[5:9]), true, true
+}
+
+// validGeoTypeCode reports whether t is one of the 28 OGC/ISO geometry type
+// codes (Point..GeometryCollection, optionally with Z/M/ZM extensions).
+func validGeoTypeCode(t uint32) bool {
+	switch {
+	case t >= 1 && t <= 7,
+		t >= 1001 && t <= 1007,
+		t >= 2001 && t <= 2007,
+		t >= 3001 && t <= 3007:
+		return true
+	}
+	return false
+}
+
+// stripEWKBSRID converts an EWKB geometry that carries an SRID prefix into
+// plain ISO/OGC WKB by clearing the SRID flag and removing the four SRID
+// bytes. Bytes that do not have the SRID flag set are returned unchanged.
+func stripEWKBSRID(b []byte) []byte {
+	if len(b) < 9 {
+		return b
+	}
+	var bo binary.ByteOrder
+	switch b[0] {
+	case 0x00:
+		bo = binary.BigEndian
+	case 0x01:
+		bo = binary.LittleEndian
+	default:
+		return b
+	}
+	typeWord := bo.Uint32(b[1:5])
+	if typeWord&ewkbSRIDFlag == 0 {
+		return b
+	}
+	out := make([]byte, len(b)-4)
+	out[0] = b[0]
+	bo.PutUint32(out[1:5], typeWord&^ewkbSRIDFlag)
+	copy(out[5:], b[9:])
+	return out
+}
+
+// stripEWKBSRIDColumn returns a column transformer that rewrites every
+// non-null value through stripEWKBSRID, producing standard WKB on the wire.
+func stripEWKBSRIDColumn(_ context.Context, a arrow.Array) (arrow.Array, error) {
+	ba, ok := a.(*array.Binary)
+	if !ok {
+		a.Retain()
+		return a, nil
+	}
+	bldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+	defer bldr.Release()
+	bldr.Reserve(ba.Len())
+	for i := 0; i < ba.Len(); i++ {
+		if ba.IsNull(i) {
+			bldr.AppendNull()
+			continue
+		}
+		bldr.Append(stripEWKBSRID(ba.Value(i)))
+	}
+	return bldr.NewArray(), nil
+}
+
+// analyzeGeoFromBatch walks the binary columns of a record batch and returns
+// a map of column-name → geoColumnInfo for any column whose first non-null
+// value parses as an OGC/EWKB geometry header. The first SRID seen is taken
+// as the column-level SRID; columns whose subsequent rows disagree are still
+// tagged as geo but without column-level CRS metadata.
+func analyzeGeoFromBatch(rec arrow.RecordBatch) map[string]geoColumnInfo {
+	if rec == nil || rec.NumRows() == 0 {
+		return nil
+	}
+	out := make(map[string]geoColumnInfo)
+	sc := rec.Schema()
+	for i, col := range rec.Columns() {
+		ba, ok := col.(*array.Binary)
+		if !ok {
+			continue
+		}
+		var (
+			firstSRID uint32
+			haveSRID  bool
+			mixed     bool
+			isGeo     bool
+			classified bool
+		)
+		for j := 0; j < ba.Len(); j++ {
+			if ba.IsNull(j) {
+				continue
+			}
+			srid, has, ok := peekEWKBGeo(ba.Value(j))
+			if !classified {
+				classified = true
+				if !ok {
+					break
+				}
+				isGeo = true
+				if has {
+					firstSRID = srid
+					haveSRID = true
+				}
+				continue
+			}
+			if !ok {
+				mixed = true
+				continue
+			}
+			if has {
+				if !haveSRID {
+					firstSRID = srid
+					haveSRID = true
+				} else if srid != firstSRID {
+					mixed = true
+				}
+			}
+		}
+		if !isGeo {
+			continue
+		}
+		info := geoColumnInfo{}
+		if haveSRID && !mixed {
+			info.srid = int(firstSRID)
+		}
+		out[sc.Field(i).Name] = info
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 type recordTransformer = func(context.Context, arrow.RecordBatch) (arrow.RecordBatch, error)
@@ -96,7 +264,7 @@ func getRecTransformer(sc *arrow.Schema, tr []colTransformer) recordTransformer 
 	}
 }
 
-func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnType) (*arrow.Schema, recordTransformer) {
+func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnInfo) (*arrow.Schema, recordTransformer) {
 	loc, types := ld.Location(), ld.RowTypes()
 
 	fields := make([]arrow.Field, len(sc.Fields()))
@@ -105,26 +273,23 @@ func getTransformer(sc *arrow.Schema, ld gosnowflake.ArrowStreamLoader, useHighP
 		srcMeta := types[i]
 		originalArrowUnit := arrow.TimeUnit(srcMeta.Scale / 3)
 
-		// With GEOGRAPHY/GEOMETRY_OUTPUT_FORMAT=WKB, geo columns arrive as binary WKB
-		// but srcMeta.Type is "binary" (Snowflake REST API limitation). Use the geoCols
-		// map (from DESCRIBE TABLE) to identify them and tag with geoarrow.wkb metadata.
-		// Data is already WKB binary — no conversion needed, just pass through.
-		if geoType, ok := geoCols[f.Name]; ok && geoType != geoColumnNone {
+		// Snowflake reports GEOGRAPHY/GEOMETRY columns as srcMeta.Type "binary"
+		// when the GEO*_OUTPUT_FORMAT session option is WKB or EWKB. The geoCols
+		// map is built by analyzeGeoFromBatch on the first record batch — any
+		// binary column whose values look like an OGC/EWKB geometry header lands
+		// here, with the column-level SRID lifted out of the EWKB prefix. Each
+		// row goes through stripEWKBSRID so the value on the Arrow wire is
+		// standard ISO/OGC WKB.
+		if geoCol, ok := geoCols[f.Name]; ok {
 			f.Type = arrow.BinaryTypes.Binary
-			if geoType == geoColumnGeography {
-				f.Metadata = arrow.MetadataFrom(map[string]string{
-					"ARROW:extension:name":     "geoarrow.wkb",
-					"ARROW:extension:metadata": `{"crs":"EPSG:4326"}`,
-				})
-			} else {
-				// TODO: GEOMETRY SRID requires inspecting data or a separate query.
-				// Same cross-driver issue as adbc-drivers/redshift#2 and
-				// adbc-drivers/databricks#350.
-				f.Metadata = arrow.MetadataFrom(map[string]string{
-					"ARROW:extension:name": "geoarrow.wkb",
-				})
+			meta := map[string]string{
+				"ARROW:extension:name": "geoarrow.wkb",
 			}
-			transformers[i] = identCol
+			if geoCol.srid != 0 {
+				meta["ARROW:extension:metadata"] = fmt.Sprintf(`{"crs":"EPSG:%d"}`, geoCol.srid)
+			}
+			f.Metadata = arrow.MetadataFrom(meta)
+			transformers[i] = stripEWKBSRIDColumn
 			fields[i] = f
 			continue
 		}
@@ -593,7 +758,7 @@ type reader struct {
 	done     chan struct{} // signals all producer goroutines have finished
 }
 
-func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision, geoCols map[string]geoColumnType) (array.RecordReader, error) {
+func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake.ArrowStreamLoader, bufferSize, prefetchConcurrency int, useHighPrecision bool, maxTimestampPrecision MaxTimestampPrecision) (array.RecordReader, error) {
 	batches, err := ld.GetBatches()
 	if err != nil {
 		return nil, errToAdbcErr(adbc.StatusInternal, err)
@@ -732,6 +897,18 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 		}
 	}
 
+	// Peek the first record from the first IPC batch so we can identify any
+	// binary columns that carry EWKB geometries (and lift their SRID into
+	// geoarrow.wkb field metadata) before fixing the result schema. The
+	// geometry shape is determined per-query from the data itself, so this
+	// works for any SQL — table scans, joins, CTEs, ST_Transform, etc. —
+	// without needing to parse the user's query text.
+	var firstRec arrow.RecordBatch
+	if rr.Next() {
+		firstRec = rr.RecordBatch()
+	}
+	geoCols := analyzeGeoFromBatch(firstRec)
+
 	// Now setup concurrency primitives after error-prone operations
 	group, ctx := errgroup.WithContext(compute.WithAllocator(ctx, alloc))
 	ctx, cancelFn := context.WithCancel(ctx)
@@ -753,6 +930,18 @@ func newRecordReader(ctx context.Context, alloc memory.Allocator, ld gosnowflake
 
 	var recTransform recordTransformer
 	rdr.schema, recTransform = getTransformer(rr.Schema(), ld, useHighPrecision, maxTimestampPrecision, geoCols)
+
+	if firstRec != nil {
+		transformed, err := recTransform(ctx, firstRec)
+		if err != nil {
+			rr.Release()
+			_ = r.Close()
+			cancelFn()
+			return nil, errToAdbcErr(adbc.StatusInternal, err)
+		}
+		// chs[0] is buffered (bufferSize >= 1), so this never blocks.
+		chs[0] <- transformed
+	}
 
 	group.Go(func() (err error) {
 		defer rr.Release()

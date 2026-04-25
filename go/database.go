@@ -532,20 +532,20 @@ func (d *databaseImpl) Open(ctx context.Context) (adbcConnection adbc.Connection
 	ctx, span := driverbase.StartSpan(ctx, "databaseImpl.Open", d)
 	defer driverbase.EndSpan(span, err)
 
-	// Set WKB output for geospatial columns so they arrive as binary WKB
-	// instead of GeoJSON strings. Geo column detection is done separately
-	// via DESCRIBE TABLE (catalog metadata is unaffected by output format).
-	// Note: Snowflake's REST API rowtype metadata reports "binary" instead of
-	// "geography"/"geometry" when WKB format is set — we've reported this to Snowflake.
+	// Request EWKB so the SRID is encoded inline in every geometry value.
+	// The record reader peeks the first batch, lifts the SRID into geoarrow.wkb
+	// field metadata, and strips the EWKB prefix so consumers see plain ISO/OGC
+	// WKB. GEOGRAPHY is always WGS84 but we keep both formats in sync for a
+	// single decoding path.
 	if d.cfg.Params == nil {
 		d.cfg.Params = make(map[string]*string)
 	}
-	wkb := "WKB"
+	ewkb := "EWKB"
 	if _, ok := d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"]; !ok {
-		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = &wkb
+		d.cfg.Params["GEOGRAPHY_OUTPUT_FORMAT"] = &ewkb
 	}
 	if _, ok := d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"]; !ok {
-		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = &wkb
+		d.cfg.Params["GEOMETRY_OUTPUT_FORMAT"] = &ewkb
 	}
 
 	connector := gosnowflake.NewConnector(drv, *d.cfg)

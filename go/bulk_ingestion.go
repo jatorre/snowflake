@@ -129,6 +129,13 @@ type ingestOptions struct {
 	// the SRID is extracted from geoarrow extension metadata and applied
 	// via ST_SETSRID after COPY INTO.
 	geoType string
+	// Whether geoType was set explicitly via SetOption. When false (the
+	// default), each geoarrow column's target type is decided per-column
+	// from its CRS metadata: a non-EPSG:4326 SRID promotes that column to
+	// GEOMETRY so the SRID survives the round trip; everything else stays
+	// GEOGRAPHY. Setting the option pins the type for all geoarrow columns
+	// and disables per-column promotion.
+	geoTypeExplicit bool
 }
 
 func DefaultIngestOptions() ingestOptions {
